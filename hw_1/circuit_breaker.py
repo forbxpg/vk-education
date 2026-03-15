@@ -1,6 +1,10 @@
 r"""Домашнее задание.
 
-Вы разрабатываете сервис-агрегатор, который периодически парсит статьи с Хабра. Внешние сервисы нестабильны: они могут отвечать долго, возвращать ошибки сети или временно быть недоступными. Если сервис "упал", нет смысла продолжать слать запросы (это может усугубить ситуацию или быть расценено как DDoS). Необходимо реализовать механизм защиты, который отслеживает здоровье внешнего сервиса и принимает решение: выполнить запрос, подождать или сразу вернуть ошибку.
+Вы разрабатываете сервис-агрегатор, который периодически парсит статьи с Хабра.
+Внешние сервисы нестабильны: они могут отвечать долго, возвращать ошибки сети или временно быть недоступными.
+Если сервис "упал", нет смысла продолжать слать запросы (это может усугубить ситуацию или быть расценено как DDoS).
+Необходимо реализовать механизм защиты, который отслеживает здоровье внешнего сервиса и принимает решение:
+выполнить запрос, подождать или сразу вернуть ошибку.
 
 В рамках этого домашнего задания у вас будет 4 задачи:
 
@@ -13,10 +17,9 @@ r"""Домашнее задание.
 from asyncio import Lock, sleep
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import wraps
-from time import time
 from typing import ParamSpec, TypeVar
 
 T = TypeVar("T")
@@ -25,82 +28,97 @@ P = ParamSpec("P")
 MIN_STATE_COUNT = 10
 MAX_ERRORS_COUNT = 10
 DEFAULT_SLEEP_TIME_SEC = 5
-DEFAULT_NETWORK_ERRORS = [ConnectionError, TimeoutError]
+DEFAULT_NETWORK_ERRORS: list[type[BaseException]] = [ConnectionError, TimeoutError]
+
+
+class CircuitBreakerOpenError(Exception):
+    """Exception raised when the circuit breaker is open."""
 
 
 class CircuitBreakerState(StrEnum):
-    """Class to represent the states of circuit breaker."""
+    """States of the Circuit Breaker finite state machine."""
 
-    # Allowed to make requests
-    ALLOWED = "allowed"
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
-    # Denied to make requests
-    DENIED = "denied"
 
-    # Try to make one request
-    FIFTY_FIFTY = "fifty_fifty"
+class CallResult(StrEnum):
+    """Result of a single call for recording in the history."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
 
 
 @dataclass
 class CircuitBreakerConfig:
     """Circuit breaker decorator config class."""
 
-    network_errors: list[type[BaseException]]
-    state_count: int = MIN_STATE_COUNT
-    error_count: int = MAX_ERRORS_COUNT
+    state_count: int = 20
+    error_count: int = 8
     sleep_time_sec: int = DEFAULT_SLEEP_TIME_SEC
+    network_errors: list[type[BaseException]] = field(
+        default_factory=lambda: list(DEFAULT_NETWORK_ERRORS),
+    )
 
     def __post_init__(self) -> None:
         """Validate decorator input params.
 
-        Args:
-            state_count: int
-            error_count: int
-
         Raises:
             ValueError:
-            - If state_count is less than MIN_STATE_COUNT or negative.
-            - If error_count is greater than MAX_ERRORS_COUNT or negative.
-
+            - If state_count <= MIN_STATE_COUNT (must be > 10).
+            - If error_count >= MAX_ERRORS_COUNT (must be < 10).
+            - If sleep_time_sec is negative.
+            - If error_count > state_count.
+            - If network_errors is empty.
 
         """
-        if self.state_count < 0 or self.error_count < 0 or self.sleep_time_sec < 0:
-            msg = "В конфиге заданы отрицательные числа!"
+        if self.sleep_time_sec < 0:
+            msg = "sleep_time_sec не может быть отрицательным."
             raise ValueError(msg)
 
-        if self.state_count < MIN_STATE_COUNT:
-            msg = f"Размер истории сообщений должен быть больше {MIN_STATE_COUNT}"
+        if self.state_count <= MIN_STATE_COUNT:
+            msg = f"state_count должен быть строго больше {MIN_STATE_COUNT}."
             raise ValueError(msg)
 
-        if self.error_count > MAX_ERRORS_COUNT:
+        if self.error_count >= MAX_ERRORS_COUNT:
+            msg = f"error_count должен быть строго меньше {MAX_ERRORS_COUNT}."
+            raise ValueError(msg)
+
+        if self.error_count > self.state_count:
             msg = (
-                f"Максимальное количество порога ошибок "
-                f"не должно превышать {MAX_ERRORS_COUNT}"
+                f"error_count ({self.error_count}) не может превышать "
+                f"state_count ({self.state_count}): порог ошибок "
+                f"никогда не будет достигнут."
             )
             raise ValueError(msg)
 
         if not self.network_errors:
-            self.network_errors = DEFAULT_NETWORK_ERRORS
+            msg = "network_errors не может быть пустым списком."
+            raise ValueError(msg)
 
 
 class CircuitBreaker:
-    """Class-based sync decorator factory to improve periodical API calls.
+    """Async decorator factory implementing the Circuit Breaker pattern.
 
-    Implements:
-        - Healthchecks of the API-server by handling exc.
-        - Between-Requests time tracking to fit the rate limits.
+    Tracks the health of an external service by recording call results
+    in a sliding window and transitions between three states:
+
+    CLOSED - normal operation, requests pass through.
+    OPEN - too many failures, requests are blocked immediately.
+    HALF_OPEN - cooldown elapsed, exactly one probe request is allowed.
 
     """
 
     def __init__(self, config: CircuitBreakerConfig) -> None:
         self._config = config
-
         self._lock = Lock()
+        self._history: deque[CallResult] = deque(maxlen=config.state_count)
+        self._state = CircuitBreakerState.CLOSED
 
-        self.start_time = time()
-
-        self._history: deque[CircuitBreakerState] = deque(maxlen=config.state_count)
-        self._current_state = CircuitBreakerState.ALLOWED
+        # Flag that says if a probe request is already in flight,
+        # other coroutines should get a rejection.
+        self._probe_in_flight = False
 
     async def _process_func_call(
         self,
@@ -108,32 +126,106 @@ class CircuitBreaker:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> T:
-        """Process the function call."""
+        """Execute the wrapped function and update circuit state.
+
+        Args:
+            func: Callable[P, Awaitable[T]]
+            *args: P.args
+            **kwargs: P.kwargs
+
+        Returns:
+            T: The result of the function call.
+
+        """
+        network_errors = tuple(self._config.network_errors)
+
+        try:
+            result = await func(*args, **kwargs)
+        except network_errors:
+            async with self._lock:
+                self._history.append(CallResult.FAILURE)
+
+                if self._state == CircuitBreakerState.HALF_OPEN:
+                    self._state = CircuitBreakerState.OPEN
+                    self._probe_in_flight = False
+                elif self._failure_count >= self._config.error_count:
+                    self._state = CircuitBreakerState.OPEN
+            raise
+
+        async with self._lock:
+            self._history.append(CallResult.SUCCESS)
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.CLOSED
+                self._probe_in_flight = False
+        return result
 
     async def _preprocess_state(self) -> bool:
-        """Preprocess the state."""
-        buffer_errors_count = self._history.count(CircuitBreakerState.DENIED)
-        if buffer_errors_count >= self._config.error_count:
+        """Check circuit state before the function call.
+
+        Returns:
+            True if the call is allowed to proceed, False otherwise.
+
+        """
+        need_backoff = False
+        need_sleep = False
+
+        async with self._lock:
+            if self._state == CircuitBreakerState.CLOSED:
+                if self._failure_count >= self._config.error_count:
+                    self._state = CircuitBreakerState.OPEN
+                    return False
+
+                if self._history and self._history[-1] == CallResult.FAILURE:
+                    need_backoff = True
+
+            elif self._state == CircuitBreakerState.OPEN:
+                if self._probe_in_flight:
+                    return False
+                self._state = CircuitBreakerState.HALF_OPEN
+                self._probe_in_flight = True
+                need_sleep = True
+
+            elif self._state == CircuitBreakerState.HALF_OPEN:
+                if self._probe_in_flight:
+                    return False
+
+        if need_sleep or need_backoff:
             await sleep(self._config.sleep_time_sec)
 
-            async with self._lock:
-                self._history.append()
+        return True
 
-    async def __call__[**P, T](
+    @property
+    def _failure_count(self) -> int:
+        """Count failures in the current history window.
+
+        Must be called under self._lock.
+        """
+        return self._history.count(CallResult.FAILURE)
+
+    def __call__(
         self,
         func: Callable[P, Awaitable[T]],
-    ) -> Callable[Callable[P, Awaitable[T]], Callable[P, Awaitable[T]]]:
-        """Call the class and run decorator."""
+    ) -> Callable[P, Awaitable[T]]:
+        """Decorate an async function with Circuit Breaker logic.
+
+        Args:
+            func: Callable[P, Awaitable[T]]
+
+        Returns:
+            Callable[P, Awaitable[T]]
+
+        """
 
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            async with self._lock:
-                if self._current_state == CircuitBreakerState.DENIED:
-                    await sleep(self._config.sleep_time_sec)
-                    self._current_state = CircuitBreakerState.FIFTY_FIFTY
+            if not await self._preprocess_state():
+                msg = (
+                    f"Circuit OPEN for {func.__qualname__}: "
+                    f"{self._failure_count}/{self._config.error_count} "
+                    f"failures in last {self._config.state_count} calls."
+                )
+                raise CircuitBreakerOpenError(msg)
+            return await self._process_func_call(func, *args, **kwargs)
 
-                elif self._current_state == CircuitBreakerState.FIFTY_FIFTY:
-                    await self._process_func_call(func, *args, **kwargs)
-
-                else:
-                    await self._process_func_call(func, *args, **kwargs)
+        return wrapper
